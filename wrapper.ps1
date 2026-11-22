@@ -48,6 +48,7 @@ Write-Output-Color "[*] Server: $ServerUrl" "Cyan"
 Write-Output-Safe ""
 
 $ScanType = "winpeas"
+$Incomplete = $false
 Write-Output-Color "[*] Detected: Windows system" "Yellow"
 $ScriptEndpoint = "$ServerUrl/get-winpeas"
 $ScriptPath = "$env:TEMP\winpeas.exe"
@@ -99,62 +100,32 @@ try {
     $Process.Start() | Out-Null
     Write-Output-Color "[*] Winpeas running (PID: $($Process.Id))..." "Yellow"
     
-    # Start async reading with real-time file writing
-    $OutputBuilder = New-Object System.Text.StringBuilder
-    $ErrorBuilder = New-Object System.Text.StringBuilder
-    
-    $OutputEventHandler = {
-        if ($EventArgs.Data -ne $null) {
-            $Line = $EventArgs.Data
-            [void]$Event.MessageData.StringBuilder.AppendLine($Line)
-            # Write to file in real-time
-            try {
-                $Event.MessageData.Writer.WriteLine($Line)
-            } catch {
-                # Ignore write errors
-            }
-        }
-    }
-    
-    $ErrorEventHandler = {
-        if ($EventArgs.Data -ne $null) {
-            $Line = $EventArgs.Data
-            [void]$Event.MessageData.ErrorBuilder.AppendLine($Line)
-        }
-    }
-    
-    # Pass StreamWriter to event handler
-    $OutputData = @{
-        StringBuilder = $OutputBuilder
-        Writer = $StreamWriter
-    }
-    $ErrorData = @{
-        ErrorBuilder = $ErrorBuilder
-    }
-    
-    $OutputEvent = Register-ObjectEvent -InputObject $Process `
-        -EventName OutputDataReceived `
-        -Action $OutputEventHandler `
-        -MessageData $OutputData
-    
-    $ErrorEvent = Register-ObjectEvent -InputObject $Process `
-        -EventName ErrorDataReceived `
-        -Action $ErrorEventHandler `
-        -MessageData $ErrorData
-    
-    $Process.BeginOutputReadLine()
-    $Process.BeginErrorReadLine()
-    
-    # Show progress while winpeas is running - track actual file size
+    # Synchronous stdout capture.
+    #
+    # This used to use Register-ObjectEvent -EventName OutputDataReceived -Action.
+    # -Action handlers are dispatched on the PowerShell pipeline thread and only
+    # sustain ~18 lines/s, while winpeas emits ~90 lines/s (~3,300 lines in ~38 s).
+    # PowerShell's event queue is lossy, so ~79% of the report (Processes, Services,
+    # Applications, Network, AD, Windows Credentials, Browsers, Interesting files...)
+    # never reached the file, and the truncation was reported as a success.
+    # Draining StandardOutput synchronously is lossless and just as fast.
     $StartTime = Get-Date
     $LastUpdate = $StartTime
     $LastSize = 0
     $StuckCount = 0
-    
-    while (-not $Process.HasExited) {
+    $LineCount = 0
+    $Output = $Process.StandardOutput
+
+    while (-not $Output.EndOfStream) {
+        $Line = $Output.ReadLine()
+        if ($null -ne $Line) {
+            $StreamWriter.WriteLine($Line)
+            $LineCount++
+        }
+
         $Now = Get-Date
-        $Elapsed = [Math]::Round(($Now - $StartTime).TotalSeconds)
-        
+        if (($Now - $LastUpdate).TotalMilliseconds -lt 500) { continue }
+
         # Get current file size (actual bytes on disk)
         $CurrentSize = 0
         if (Test-Path $TmpOutput) {
@@ -167,24 +138,23 @@ try {
             }
         }
         $CurrentKB = [Math]::Round($CurrentSize / 1KB, 1)
-        
+        $Elapsed = [Math]::Round(($Now - $StartTime).TotalSeconds)
+
         # Detect if stuck (no progress)
         if ($CurrentSize -eq $LastSize) {
             $StuckCount++
         } else {
             $StuckCount = 0
         }
-        
+
         # Non-interactive mode: periodic text updates
         if (-not $IsInteractive) {
             if (($Now - $LastUpdate).TotalSeconds -ge 10) {
                 if ($StuckCount -ge 20) {
-                    # No progress for 10 seconds
                     Write-Output "[*] Running... $Elapsed sec | Output: $CurrentKB KB (enumeration in progress)"
                 } else {
                     Write-Output "[*] Running... $Elapsed sec | Output: $CurrentKB KB"
                 }
-                $LastUpdate = $Now
             }
         } else {
             # Interactive mode: live display
@@ -196,32 +166,60 @@ try {
                 Write-Host "`r[*] Running: $Minutes`:$($Seconds.ToString('00')) | Output: $CurrentKB KB" -NoNewline -ForegroundColor Cyan
             }
         }
-        
+
         $LastSize = $CurrentSize
-        Start-Sleep -Milliseconds 500
+        $LastUpdate = $Now
     }
-    
+
+    # EOF on stdout: winpeas is done. Collect exit code and stderr.
+    # (winpeas writes almost nothing to stderr, so draining it after stdout
+    #  cannot deadlock on a full 4 KB stderr buffer.)
     $Process.WaitForExit()
     $ExitCode = $Process.ExitCode
-    
+    $StderrText = ""
+    try {
+        $StderrText = $Process.StandardError.ReadToEnd()
+    } catch {
+        $StderrText = ""
+    }
+
     # Close stream writer
     $StreamWriter.Close()
     $StreamWriter.Dispose()
     $FileStream.Close()
     $FileStream.Dispose()
-    
+
     # Get final size
     $FinalSize = 0
     if (Test-Path $TmpOutput) {
         $FinalSize = (Get-Item $TmpOutput).Length
     }
     $FinalKB = [Math]::Round($FinalSize / 1KB, 1)
-    
-    # Cleanup events
-    Unregister-Event -SourceIdentifier $OutputEvent.Name
-    Unregister-Event -SourceIdentifier $ErrorEvent.Name
-    Remove-Job -Id $OutputEvent.Id -Force
-    Remove-Job -Id $ErrorEvent.Id -Force
+
+    # Verify the capture is complete: winpeas always ends with its "Thank you!"
+    # credit box, a truncated capture never reaches it.
+    $CaptureComplete = $false
+    try {
+        $CapturedText = [System.IO.File]::ReadAllText($TmpOutput)
+        if ($CapturedText.Length -gt 0) {
+            $TailStart = [Math]::Max(0, $CapturedText.Length - 3000)
+            $TailText = $CapturedText.Substring($TailStart)
+            if ($TailText -match 'Thank you!' -and $LineCount -gt 1000) {
+                $CaptureComplete = $true
+            }
+        }
+    } catch {
+        $CaptureComplete = $false
+    }
+
+    if (-not $CaptureComplete) {
+        $ScanType = "winpeas_partial"
+        $Incomplete = $true
+        Write-Output-Color "[!] WARNING: winpeas output looks INCOMPLETE ($LineCount lines, $FinalKB KB, no end banner)." "Red"
+        Write-Output-Color "[!] Uploading as scan type 'winpeas_partial' so it is not mistaken for a full scan." "Red"
+    } else {
+        Write-Output-Color "[+] Capture complete: $LineCount lines, $FinalKB KB (end banner found)." "Green"
+    }
     
     if ($IsInteractive) {
         Write-Host "`r[+] Complete! | Output: $FinalKB KB                                    " -ForegroundColor Green
@@ -230,7 +228,7 @@ try {
     Write-Output-Safe ""
     
     # Append errors to file if any
-    $ErrorOutput = $ErrorBuilder.ToString()
+    $ErrorOutput = $StderrText
     if ($ErrorOutput) {
         [System.IO.File]::AppendAllText($TmpOutput, "`n`n=== STDERR ===`n" + $ErrorOutput)
     }
@@ -362,6 +360,10 @@ if ($Success) {
     Write-Output-Color "[+] Cleaning up..." "Green"
     Remove-Item -Path $ScriptPath -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $TmpOutput -Force -ErrorAction SilentlyContinue
+    if ($Incomplete) {
+        Write-Output-Color "[!] Done, but the capture was INCOMPLETE - the report is truncated." "Red"
+        exit 2
+    }
     Write-Output-Color "[+] Done!" "Green"
     exit 0
 } else {
