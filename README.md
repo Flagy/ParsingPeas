@@ -83,11 +83,14 @@ cd ParsingPeas
 ./setup.sh                      # downloads LinPEAS + WinPEAS into scripts/
 pip3 install -r requirements.txt
 python3 receiver.py             # serves on http://0.0.0.0:8005
+python3 receiver.py -i tun0     # same, and the startup hints show tun0's IP
 ```
 
-Leave `receiver.py` running. Find the IP the target will reach you on:
-- **HTB / VPN:** your `tun0` address — `ip -4 addr show tun0`
-- **LAN:** your normal interface IP
+Leave `receiver.py` running. The address the target must reach you on:
+- **HTB / VPN:** your `tun0` address — pass `-i tun0` and it is filled into the
+  startup hints automatically (otherwise read it with `ip -4 addr show tun0`)
+- **LAN:** your normal interface IP — e.g. `-i eth0`
+- no `-i`: the hints keep the `YOUR_IP` placeholder
 
 ### On the target
 

